@@ -16,8 +16,16 @@ monthly generator inventory ([Form EIA-860M](https://www.eia.gov/electricity/dat
 
 The app downloads the latest EIA-860M workbook straight from eia.gov (no API key) and reads
 the `Operating` and `Planned` sheets, keeping energy source `SUN` and prime mover `PV`.
-The parsed snapshot is cached to `eia860m_solar.rds`. After 24 hours the app checks only
-for a newer month; the **Check EIA for a newer month** button does the same on demand.
+Array details come from the annual [Form EIA-860](https://www.eia.gov/electricity/data/eia860/),
+Schedule 3_3 Solar, joined on plant and generator ID: tracking type (single-axis, dual-axis,
+fixed tilt, east-west), bifacial, DC capacity and ILR, module material, and tilt/azimuth.
+They appear in the site popups, the site table and the owner table (operating MWdc and
+tracker share). The annual file lags about a year, so recent plants and the pipeline show
+as not yet reported.
+
+The parsed snapshots are cached to `eia860m_solar.rds` (checked for a newer month after
+24 hours) and `eia860_solar_arrays.rds` (checked for a newer annual release after 30 days).
+The **Check EIA for newer data** button checks both on demand.
 
 ## Run locally
 

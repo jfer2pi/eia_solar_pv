@@ -8,6 +8,9 @@
 #          - Operating : units in service (OP, SB, OS, OA)
 #          - Planned   : pipeline units (P, L, T, U, V, TS) with planned COD
 #        Filtered to energy source SUN + prime mover PV (excludes CSP).
+#        Array details (tracking type, bifacial, DC capacity, ILR, module
+#        material, tilt/azimuth) come from the annual Form EIA-860,
+#        Schedule 3_3 Solar, joined on plant + generator ID.
 #        No API key needed.
 # Map:   OpenStreetMap tiles (dark-filtered for the Linear look, plus the
 #        standard OSM style). Light use only, per the OSM tile usage policy:
@@ -19,8 +22,9 @@
 #                    "leaflet","plotly","DT","htmltools"))
 # shiny::runApp()
 #
-# The parsed snapshot is cached to eia860m_solar.rds next to this file and
-# refreshed after 24 h (EIA publishes once a month, ~2 month lag).
+# The parsed snapshots are cached next to this file: eia860m_solar.rds
+# (checked for a newer month after 24 h; EIA publishes monthly, ~2 month lag)
+# and eia860_solar_arrays.rds (checked for a newer annual release after 30 days).
 # =============================================================================
 
 library(shiny)
@@ -185,16 +189,188 @@ load_solar <- function() {
   out
 }
 
+# ---- Array details: annual Form EIA-860, Schedule 3_3 Solar -------------------
+# The monthly 860M has no mounting or module information. The annual EIA-860
+# solar sheet does, per generator: single-axis / dual-axis / fixed tilt /
+# east-west tracking flags, bifacial, tilt and azimuth, DC capacity and module
+# material. It runs about a year behind, so recent plants and the pipeline
+# show as "not yet reported". Optional: the app works without it.
+
+EIA860_ZIPS <- c(
+  final   = "https://www.eia.gov/electricity/data/eia860/xls/eia860%d.zip",
+  early   = "https://www.eia.gov/electricity/data/eia860/xls/eia860%dER.zip",
+  archive = "https://www.eia.gov/electricity/data/eia860/archive/xls/eia860%d.zip"
+)
+ARRAY_CACHE <- "eia860_solar_arrays.rds"
+ARRAY_TTL   <- 30 * 24 * 3600  # annual data: look for a newer release monthly
+
+# Newest first: each data year's final release, then its early release.
+# With `newer_than` (a previous result), only strictly newer releases are tried.
+download_latest_860 <- function(newer_than = NULL, years_back = 4) {
+  cy <- as.integer(format(Sys.Date(), "%Y"))
+  for (y in (cy - 1):(cy - years_back)) {
+    for (kind in c("final", "early")) {
+      if (!is.null(newer_than)) {
+        newer <- y > newer_than$year ||
+          (y == newer_than$year && kind == "final" && newer_than$release == "early")
+        if (!newer) return(NULL)
+      }
+      urls <- if (kind == "final") EIA860_ZIPS[c("final", "archive")] else EIA860_ZIPS["early"]
+      for (u in sprintf(urls, y)) {
+        tmp <- tempfile(fileext = ".zip")
+        ok <- tryCatch({
+          resp <- request(u) |>
+            req_user_agent("shiny-solar-fleet-dashboard (R/httr2)") |>
+            req_timeout(300) |>
+            req_error(is_error = \(r) FALSE) |>
+            req_perform(path = tmp)
+          resp_status(resp) == 200 && any(grepl("3_3_Solar", unzip(tmp, list = TRUE)$Name))
+        }, error = \(e) FALSE)
+        if (isTRUE(ok)) {
+          message("EIA-860 (", kind, " ", y, "): using ", u)
+          return(list(path = tmp, url = u, year = y, release = kind))
+        }
+      }
+    }
+  }
+  stop("Could not find an EIA-860 annual release in the last ", years_back, " years.",
+       call. = FALSE)
+}
+
+yn <- function(x) {
+  x <- toupper(trimws(x))
+  ifelse(x %in% c("Y", "YES", "TRUE"), TRUE, ifelse(x %in% c("N", "NO", "FALSE"), FALSE, NA))
+}
+
+# First column whose cleaned name matches a regex (layouts shift between years)
+pick_rx <- function(d, rx) {
+  nm <- grep(rx, names(d), value = TRUE)
+  if (length(nm)) d[[nm[1]]] else rep(NA_character_, nrow(d))
+}
+
+norm_plant <- function(x) as.character(as.integer(num(x)))
+norm_gen   <- function(x) toupper(trimws(x))
+
+build_arrays <- function(src = download_latest_860()) {
+  inner <- grep("3_3_Solar.*\\.xlsx?$", unzip(src$path, list = TRUE)$Name, value = TRUE)[1]
+  exdir <- tempfile("eia860_"); dir.create(exdir)
+  xlsx  <- unzip(src$path, files = inner, exdir = exdir, junkpaths = TRUE)
+  sheet <- grep("^operable", excel_sheets(xlsx), ignore.case = TRUE, value = TRUE)[1]
+  raw <- read_excel(xlsx, sheet = sheet, col_names = FALSE, col_types = "text",
+                    .name_repair = "minimal")
+  hdr <- which(apply(raw[seq_len(min(15, nrow(raw))), ], 1,
+                     \(r) any(trimws(r) %in% c("Plant Code", "Plant ID"))))[1]
+  if (is.na(hdr)) stop("Header row not found in ", inner, call. = FALSE)
+  d <- raw[-seq_len(hdr), ]
+  names(d) <- make.unique(clean_names(unlist(raw[hdr, ])))
+
+  sat  <- yn(pick_rx(d, "^single_axis"));  dat <- yn(pick_rx(d, "^dual_axis"))
+  fix  <- yn(pick_rx(d, "^fixed_tilt"));   ew  <- yn(pick_rx(d, "^east_west"))
+  csi  <- yn(pick_rx(d, "crystalline"));   cdte <- yn(pick_rx(d, "cdte"))
+  thin <- Reduce(`|`, lapply(grep("^thin_film_(?!cdte)", names(d), value = TRUE, perl = TRUE),
+                             \(n) coalesce(yn(d[[n]]), FALSE)), FALSE)
+  n_mount <- rowSums(cbind(sat, dat, fix, ew), na.rm = TRUE)
+
+  arrays <- tibble(
+    plant_id   = norm_plant(pick_rx(d, "^plant_(code|id)$")),
+    gen_id     = norm_gen(pick_rx(d, "^generator_id$")),
+    array_type = case_when(
+      n_mount > 1         ~ "Mixed",
+      coalesce(sat, FALSE) ~ "Single-axis tracker",
+      coalesce(dat, FALSE) ~ "Dual-axis tracker",
+      coalesce(ew, FALSE)  ~ "East-west fixed",
+      coalesce(fix, FALSE) ~ "Fixed tilt",
+      TRUE                 ~ NA_character_),
+    bifacial   = yn(pick_rx(d, "bifacial")),
+    module     = case_when(
+      coalesce(csi, FALSE) & (coalesce(cdte, FALSE) | thin) ~ "c-Si + thin film",
+      coalesce(csi, FALSE)  ~ "c-Si",
+      coalesce(cdte, FALSE) ~ "CdTe thin film",
+      thin                  ~ "Thin film",
+      TRUE                  ~ NA_character_),
+    tilt       = num(pick_rx(d, "^tilt_angle")),
+    azimuth    = num(pick_rx(d, "^azimuth")),
+    mwdc       = num(pick_rx(d, "^dc_net_capacity|^dc_capacity"))
+  ) |>
+    filter(!is.na(plant_id), !is.na(gen_id)) |>
+    distinct(plant_id, gen_id, .keep_all = TRUE)
+
+  list(arrays = arrays, url = src$url, year = src$year, release = src$release,
+       fetched = Sys.time())
+}
+
+# Same pattern as load_solar(), but never fatal: on any failure without a
+# cache the dashboard simply shows array details as unavailable.
+load_arrays <- function() {
+  cached <- if (file.exists(ARRAY_CACHE)) readRDS(ARRAY_CACHE) else NULL
+  if (!is.null(cached) &&
+      difftime(Sys.time(), file.mtime(ARRAY_CACHE), units = "secs") < ARRAY_TTL) {
+    return(cached)
+  }
+  out <- tryCatch({
+    src <- download_latest_860(newer_than = cached)
+    if (is.null(src)) NULL else build_arrays(src)
+  }, error = function(e) {
+    warning("EIA-860 array data unavailable: ", conditionMessage(e))
+    NULL
+  })
+  if (is.null(out)) {
+    if (!is.null(cached)) Sys.setFileTime(ARRAY_CACHE, Sys.time())
+    return(cached)
+  }
+  saveRDS(out, ARRAY_CACHE)
+  out
+}
+
+array_label <- function(a) {
+  if (is.null(a)) return("EIA-860 (unavailable)")
+  sprintf("EIA-860 %d%s", a$year, if (a$release == "early") " early release" else "")
+}
+
+ARRAY_COLS <- c("Single-axis tracker" = "#7C85E4", "Dual-axis tracker" = "#B59AF8",
+                "Fixed tilt" = "#F2C94C", "East-west fixed" = "#F2994A", "Mixed" = "#8A8F98")
+ARRAY_SHORT <- c("Single-axis tracker" = "single-axis", "Dual-axis tracker" = "dual-axis",
+                 "Fixed tilt" = "fixed tilt", "East-west fixed" = "east-west",
+                 "Mixed" = "mixed")
+
+# Site-level roll-ups across a site's generators, weighted by AC MW
+site_array <- function(type, mw) {
+  k <- !is.na(type)
+  if (!any(k)) return(NA_character_)
+  t <- tapply(mw[k], type[k], sum)
+  if (length(t) == 1) return(names(t))
+  sprintf("Mixed, mostly %s", ARRAY_SHORT[[names(t)[which.max(t)]]])
+}
+site_bifacial <- function(b, mw) {
+  k <- !is.na(b)
+  if (!any(k)) return(NA_character_)
+  if (all(b[k])) "Yes" else if (!any(b[k])) "No" else "Partial"
+}
+wmean <- function(x, w) {
+  k <- !is.na(x) & !is.na(w) & w > 0
+  if (!any(k)) NA_real_ else sum(x[k] * w[k]) / sum(w[k])
+}
 
 CY    <- as.integer(format(Sys.Date(), "%Y"))
 
 # Everything the app derives from a snapshot, so a refresh can swap it whole
-prep_solar <- function(solar) {
+prep_solar <- function(solar, arrays = NULL) {
   # Pipeline units whose planned COD has already passed are shown as "this year"
   G <- solar$gens |>
-    mutate(year_plot = ifelse(stage != "Operating" & !is.na(year) & year < CY, CY, year))
+    mutate(year_plot = ifelse(stage != "Operating" & !is.na(year) & year < CY, CY, year),
+           plant_key = norm_plant(plant_id), gen_key = norm_gen(gen_id))
+  arr_cols <- tibble(plant_id = character(), gen_id = character(),
+                     array_type = character(), bifacial = logical(), module = character(),
+                     tilt = numeric(), azimuth = numeric(), mwdc = numeric())
+  A <- if (is.null(arrays)) arr_cols else arrays$arrays
+  G <- G |>
+    left_join(rename(A, plant_key = plant_id, gen_key = gen_id),
+              by = c("plant_key", "gen_key")) |>
+    select(-plant_key, -gen_key)
   list(
     raw          = solar,
+    arrays       = arrays,
+    array_label  = array_label(arrays),
     G            = G,
     period_label = format(solar$period, "%B %Y"),
     yr_rng       = range(G$year_plot, na.rm = TRUE),
@@ -210,8 +386,10 @@ current_data <- local({
   key <- NULL; val <- NULL
   function() {
     s <- load_solar()
-    k <- format(s$fetched, "%Y-%m-%d %H:%M:%OS3")
-    if (!identical(k, key)) { val <<- prep_solar(s); key <<- k }
+    a <- load_arrays()
+    k <- paste(format(s$fetched, "%Y-%m-%d %H:%M:%OS3"),
+               if (is.null(a)) "none" else format(a$fetched, "%Y-%m-%d %H:%M:%OS3"))
+    if (!identical(k, key)) { val <<- prep_solar(s, a); key <<- k }
     val
   }
 })
@@ -287,6 +465,7 @@ theme <- bs_theme(
        border:1px solid %4$s; box-shadow:0 8px 24px rgba(0,0,0,0.5); }
   .leaflet-popup-content { margin:12px 14px; font-size:0.78rem; line-height:1.55; }
   .pop-k { color:%2$s; }
+  .pop-na { color:%3$s; font-style:italic; }
   .pop-stage { display:inline-block; font-size:0.68rem; padding:1px 7px; border-radius:999px;
                border:1px solid currentColor; margin-bottom:4px; }
   .info.legend, .size-legend { background:rgba(15,16,17,0.92) !important; color:%6$s !important;
@@ -384,7 +563,7 @@ page_sidebar(
     actionButton("reset", "Reset filters", class = "btn-lin w-100"),
     hr(style = sprintf("border-color:%s; opacity:1; margin:14px 0 10px;", lin$border)),
     div(class = "sec", "Data"),
-    actionButton("refresh", "Check EIA for a newer month",
+    actionButton("refresh", "Check EIA for newer data",
                  icon = icon("rotate"), class = "btn-lin w-100"),
     div(style = "height:10px"),
     uiOutput("meta")
@@ -456,6 +635,12 @@ server <- function(input, output, session) {
         "Capacity is nameplate MWac, rolled up to one bubble per site and stage. ",
         "Pipeline units with a planned COD already in the past are shown in ", CY, ".",
         br(), br(),
+        "Array type, bifacial, DC capacity, module and angles: ",
+        if (is.null(D()$arrays)) "annual EIA-860 not available right now." else
+          tagList(a(D()$array_label, href = D()$arrays$url, target = "_blank"),
+                  " (Schedule 3_3 Solar), matched by plant and generator ID. ",
+                  "Newer plants and the pipeline show as not yet reported."),
+        br(), br(),
         "Map data © ", a("OpenStreetMap", href = "https://www.openstreetmap.org/copyright",
                          target = "_blank"), " contributors.",
         br(), sprintf("Downloaded %s", format(s$fetched, "%Y-%m-%d %H:%M")))
@@ -472,34 +657,52 @@ server <- function(input, output, session) {
     updateSliderInput(session, "yr", min = d$yr_rng[1], max = d$yr_rng[2], value = d$yr_rng)
   }
 
+  # Checks both sources: a newer EIA-860M month and a newer annual EIA-860
   observeEvent(input$refresh, {
-    current <- D()$raw$period
-    id <- showNotification(sprintf("Checking eia.gov for a month newer than %s…",
-                                   D()$period_label), duration = NULL, type = "message")
+    id <- showNotification(sprintf("Checking eia.gov for data newer than %s / %s…",
+                                   D()$period_label, D()$array_label),
+                           duration = NULL, type = "message")
     on.exit(removeNotification(id), add = TRUE)
     updateActionButton(session, "refresh", label = "Checking…")
-    on.exit(updateActionButton(session, "refresh", label = "Check EIA for a newer month"),
+    on.exit(updateActionButton(session, "refresh", label = "Check EIA for newer data"),
             add = TRUE)
 
-    res <- tryCatch({
-      src <- download_latest_860m(newer_than = current)
-      if (is.null(src)) "latest" else build_solar(src)
+    monthly <- tryCatch({
+      src <- download_latest_860m(newer_than = D()$raw$period)
+      if (is.null(src)) NULL else build_solar(src)
+    }, error = function(e) e)
+    annual <- tryCatch({
+      src <- download_latest_860(newer_than = D()$arrays)
+      if (is.null(src)) NULL else build_arrays(src)
     }, error = function(e) e)
 
-    if (inherits(res, "error")) {
-      showNotification(paste("Refresh failed:", conditionMessage(res)),
-                       type = "error", duration = 8)
-    } else if (identical(res, "latest")) {
-      showNotification(sprintf("Already on the latest EIA-860M release (%s).",
-                               D()$period_label), type = "message", duration = 5)
-    } else {
-      saveRDS(res, CACHE_FILE)
-      new <- prep_solar(res)
+    msgs <- character()
+    solar  <- D()$raw
+    arrays <- D()$arrays
+    if (inherits(monthly, "error")) {
+      msgs <- c(msgs, paste("EIA-860M check failed:", conditionMessage(monthly)))
+    } else if (!is.null(monthly)) {
+      saveRDS(monthly, CACHE_FILE); solar <- monthly
+    }
+    if (inherits(annual, "error")) {
+      msgs <- c(msgs, paste("EIA-860 check failed:", conditionMessage(annual)))
+    } else if (!is.null(annual)) {
+      saveRDS(annual, ARRAY_CACHE); arrays <- annual
+    }
+
+    changed <- !identical(solar, D()$raw) || !identical(arrays, D()$arrays)
+    if (changed) {
+      new <- prep_solar(solar, arrays)
       D(new)
       sync_inputs(new)
-      showNotification(sprintf("Updated to EIA-860M %s.", new$period_label),
+      showNotification(sprintf("Updated: EIA-860M %s, %s.", new$period_label, new$array_label),
+                       type = "message", duration = 6)
+    } else if (!length(msgs)) {
+      showNotification(sprintf("Already on the latest releases (EIA-860M %s, %s).",
+                               D()$period_label, D()$array_label),
                        type = "message", duration = 5)
     }
+    for (m in msgs) showNotification(m, type = "error", duration = 8)
   })
 
   observeEvent(input$reset, {
@@ -535,10 +738,22 @@ server <- function(input, output, session) {
         county = first(county), sector = first(sector), ba = first(ba),
         status = paste(unique(status), collapse = "; "),
         lat = first(lat), lon = first(lon),
-        mw = sum(mw), n_gen = n(),
         yr_first = first(year), mo_first = first(month),
         yr_last = suppressWarnings(max(year, na.rm = TRUE)),
+        # array details from the annual EIA-860, rolled up by AC MW
+        array    = site_array(array_type, mw),
+        bifacial = site_bifacial(bifacial, mw),
+        module   = if (all(is.na(module))) NA_character_ else
+                     paste(sort(unique(na.omit(module))), collapse = " + "),
+        tilt     = wmean(tilt, mw),
+        azimuth  = wmean(azimuth, mw),
+        mwdc     = if (all(is.na(mwdc))) NA_real_ else sum(mwdc, na.rm = TRUE),
+        mwac_dc  = sum(mw[!is.na(mwdc)]),
+        known_mw   = sum(mw[!is.na(array_type)]),
+        tracker_mw = sum(mw[array_type %in% c("Single-axis tracker", "Dual-axis tracker")]),
+        mw = sum(mw), n_gen = n(),
         .groups = "drop") |>
+      mutate(ilr = ifelse(!is.na(mwdc) & mwac_dc > 0, mwdc / mwac_dc, NA_real_)) |>
       mutate(yr_last = ifelse(is.finite(yr_last), yr_last, NA_integer_)) |>
       filter(mw >= input$mw[1], mw <= input$mw[2])
   })
@@ -604,12 +819,38 @@ server <- function(input, output, session) {
     proxy <- leafletProxy("map") |> clearGroup("sites") |> clearGroup("focus")
     if (!nrow(d)) return()
     col <- unname(STAGE_COLS[as.character(d$stage)])
+    # Array block from the annual EIA-860 (one to three lines, only what's known)
+    arr_line <- ifelse(
+      is.na(d$array),
+      sprintf("<span class='pop-k'>Array</span> <span class='pop-na'>%s</span><br>",
+              ifelse(d$stage == "Operating",
+                     paste("not in", D()$array_label), "reported once operating")),
+      sprintf("<span class='pop-k'>Array</span> %s%s<br>", htmlEscape(d$array),
+              ifelse(is.na(d$bifacial), "",
+                     paste0(" &middot; ", ifelse(d$bifacial == "Yes", "bifacial",
+                                          ifelse(d$bifacial == "No", "monofacial",
+                                                 "partly bifacial"))))))
+    dc_line <- ifelse(is.na(d$mwdc), "",
+      sprintf("<span class='pop-k'>DC</span> %s MWdc%s<br>",
+              formatC(d$mwdc, format = "f", digits = 1, big.mark = ","),
+              ifelse(is.na(d$ilr), "", sprintf(" &middot; <span class='pop-k'>ILR</span> %.2f", d$ilr))))
+    ang <- ifelse(is.na(d$tilt) & is.na(d$azimuth), NA_character_,
+                  sprintf("tilt %s&deg; / az %s&deg;",
+                          ifelse(is.na(d$tilt), "-", round(d$tilt)),
+                          ifelse(is.na(d$azimuth), "-", round(d$azimuth))))
+    mod_line <- ifelse(is.na(d$module) & is.na(ang), "",
+      sprintf("<span class='pop-k'>Module</span> %s<br>",
+              paste0(ifelse(is.na(d$module), "", htmlEscape(d$module)),
+                     ifelse(!is.na(d$module) & !is.na(ang), " &middot; ", ""),
+                     ifelse(is.na(ang), "", ang))))
+
     pop <- sprintf(
       "<span class='pop-stage' style='color:%s'>%s</span><br>
        <b>%s</b><br>
        <span class='pop-k'>Owner</span> %s<br>
        <span class='pop-k'>Location</span> %s, %s<br>
        <span class='pop-k'>Capacity</span> %s MWac &middot; %d unit%s<br>
+       %s%s%s
        <span class='pop-k'>%s</span> %s<br>
        <span class='pop-k'>Status</span> %s<br>
        <span class='pop-k'>Sector</span> %s &middot; <span class='pop-k'>BA</span> %s &middot;
@@ -618,6 +859,7 @@ server <- function(input, output, session) {
       htmlEscape(ifelse(is.na(d$county), "-", d$county)), d$state,
       formatC(d$mw, format = "f", digits = 1, big.mark = ","), d$n_gen,
       ifelse(d$n_gen == 1, "", "s"),
+      arr_line, dc_line, mod_line,
       ifelse(d$stage == "Operating", "In service", "Planned online"), d$online,
       htmlEscape(d$status), htmlEscape(d$sector), d$ba, d$plant_id)
     lab <- sprintf("%s · %s MW · %s", d$plant,
@@ -762,6 +1004,15 @@ server <- function(input, output, session) {
       summarise(
         `Operating sites` = sum(stage == "Operating"),
         `Operating MWac`  = sum(mw[stage == "Operating"]),
+        `Operating MWdc`  = {
+          o <- stage == "Operating" & !is.na(mwdc)
+          if (any(o)) sum(mwdc[o]) else NA_real_
+        },
+        # share of operating MWac with a known array type that is on trackers
+        `Tracker share`   = {
+          k <- sum(known_mw[stage == "Operating"])
+          if (k > 0) sum(tracker_mw[stage == "Operating"]) / k else NA_real_
+        },
         `Under constr. MWac` = sum(mw[stage == "Under construction"]),
         `Permitted MWac`  = sum(mw[stage == "Permitted"]),
         `Earlier-stage MWac` = sum(mw[stage %in% c("Pending approval", "Early planning")]),
@@ -787,11 +1038,11 @@ server <- function(input, output, session) {
       style = "bootstrap5", class = "compact hover",
       options = list(pageLength = 15, dom = "Bftip", buttons = list("csv", "excel"),
                      order = list(list(2, "desc")),
-                     columnDefs = list(list(className = "dt-right", targets = c(1:7, 9))))
+                     columnDefs = list(list(className = "dt-right", targets = c(1:9, 11))))
     ) |>
-      formatRound(c("Operating MWac", "Under constr. MWac", "Permitted MWac",
+      formatRound(c("Operating MWac", "Operating MWdc", "Under constr. MWac", "Permitted MWac",
                     "Earlier-stage MWac", "Total incl. pipeline"), digits = 0) |>
-      formatPercentage("Share of operating", digits = 1) |>
+      formatPercentage(c("Share of operating", "Tracker share"), digits = 1) |>
       formatStyle("Operating MWac",
                   background = styleColorBar(c(0, max(d$`Operating MWac`, 1)),
                                              "rgba(94,106,210,0.35)"),
@@ -808,13 +1059,19 @@ server <- function(input, output, session) {
   output$sites_tbl <- renderDT({
     datatable(
       sites() |> transmute(Site = plant, Stage = stage, Owner = owner, State = state,
-                           County = county, MWac = round(mw, 1), Units = n_gen,
-                           `Online` = online, Sector = sector, BA = ba, `EIA ID` = plant_id),
+                           County = county, MWac = round(mw, 1), MWdc = round(mwdc, 1),
+                           ILR = round(ilr, 2), Array = array,
+                           Bifacial = bifacial, Module = module,
+                           `Tilt °` = round(tilt), `Azimuth °` = round(azimuth),
+                           Units = n_gen, `Online` = online, Sector = sector, BA = ba,
+                           `EIA ID` = plant_id),
       rownames = FALSE, selection = "single", style = "bootstrap5", class = "compact hover",
       options = list(pageLength = 12, dom = "ftip", order = list(list(5, "desc")),
-                     columnDefs = list(list(className = "dt-right", targets = 5:6)))
+                     scrollX = TRUE,
+                     columnDefs = list(list(className = "dt-right", targets = c(5:7, 11:13))))
     ) |>
-      formatStyle("Stage", color = styleEqual(STAGES, unname(STAGE_COLS)))
+      formatStyle("Stage", color = styleEqual(STAGES, unname(STAGE_COLS))) |>
+      formatStyle("Array", color = styleEqual(names(ARRAY_COLS), unname(ARRAY_COLS)))
   })
 
   observeEvent(input$sites_tbl_rows_selected, {
