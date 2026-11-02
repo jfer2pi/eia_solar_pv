@@ -329,6 +329,7 @@ array_label <- function(a) {
 
 ARRAY_COLS <- c("Single-axis tracker" = "#7C85E4", "Dual-axis tracker" = "#B59AF8",
                 "Fixed tilt" = "#F2C94C", "East-west fixed" = "#F2994A", "Mixed" = "#8A8F98")
+ARRAY_FILTER <- c(names(ARRAY_COLS), "Not reported")  # sidebar choices
 ARRAY_SHORT <- c("Single-axis tracker" = "single-axis", "Dual-axis tracker" = "dual-axis",
                  "Fixed tilt" = "fixed tilt", "East-west fixed" = "east-west",
                  "Mixed" = "mixed")
@@ -456,6 +457,7 @@ theme <- bs_theme(
   .irs--shiny .irs-min, .irs--shiny .irs-max { background:#1C1D1F; color:%2$s; font-size:0.68rem; }
   .btn-lin { background:#141516; border:1px solid %4$s; color:%6$s; font-size:0.78rem; }
   .btn-lin:hover { background:#1C1D1F; color:%6$s; }
+  .btn-dl { padding:2px 10px; font-size:0.72rem; line-height:1.4; white-space:nowrap; }
   .meta { color:%3$s; font-size:0.72rem; line-height:1.5; }
   .meta a { color:%2$s; }
   /* OpenStreetMap standard tiles, recoloured to sit in the dark UI */
@@ -532,6 +534,16 @@ size_legend_html <- function() {
           <svg width='%d' height='%d'>%s</svg></div>", ceiling(2 * max(r) + 30), ceiling(h + 12), circles)
 }
 
+# Card header with a CSV download button on the right
+table_header <- function(title, sub, dl_id) {
+  card_header(
+    class = "d-flex align-items-center gap-2",
+    span(title, span(class = "sub", sub)),
+    div(class = "ms-auto",
+        downloadButton(dl_id, "CSV", icon = icon("download"), class = "btn-lin btn-dl"))
+  )
+}
+
 # ---- UI ---------------------------------------------------------------------
 
 # UI is a function so every new visitor gets controls built from the newest
@@ -555,6 +567,8 @@ page_sidebar(
                    options = list(placeholder = "All states")),
     selectizeInput("sector", "Sector", choices = sort(unique(na.omit(G$sector))),
                    multiple = TRUE, options = list(placeholder = "All sectors")),
+    selectizeInput("array", "Array type", choices = ARRAY_FILTER, multiple = TRUE,
+                   options = list(placeholder = "All array types")),
     sliderInput("mw", "Site size (MWac)", min = 0, max = SITE_MW_MAX,
                 value = c(1, SITE_MW_MAX), step = 1, ticks = FALSE),
     sliderInput("yr", "Online year (actual or planned)", min = yr_rng[1], max = yr_rng[2],
@@ -603,14 +617,15 @@ page_sidebar(
 
   card(
     full_screen = TRUE,
-    card_header("Capacity by owner", span(class = "sub",
-      "EIA entity (owner/operator) · MWac · respects all filters")),
+    table_header("Capacity by owner",
+                 "EIA entity (owner/operator) · array mix from EIA-860 · respects all filters",
+                 "dl_owners"),
     card_body(DTOutput("owners"))
   ),
 
   card(
     full_screen = TRUE,
-    card_header("Sites", span(class = "sub", "select a row to fly to it on the map")),
+    table_header("Sites", "select a row to fly to it on the map", "dl_sites"),
     card_body(DTOutput("sites_tbl"))
   )
 )
@@ -710,6 +725,7 @@ server <- function(input, output, session) {
                              selected = c("Operating", "Under construction", "Permitted"))
     updateSelectizeInput(session, "state", selected = character(0))
     updateSelectizeInput(session, "sector", selected = character(0))
+    updateSelectizeInput(session, "array", selected = character(0))
     updateSliderInput(session, "mw", value = c(1, D()$site_max))
     updateSliderInput(session, "yr", value = D()$yr_rng)
     updateTextInput(session, "q", value = "")
@@ -722,6 +738,9 @@ server <- function(input, output, session) {
     d <- D()$G |> filter(is.na(year_plot) | (year_plot >= input$yr[1] & year_plot <= input$yr[2]))
     if (length(input$state))  d <- filter(d, state %in% input$state)
     if (length(input$sector)) d <- filter(d, sector %in% input$sector)
+    # Generator-level, so a site with mixed mounting keeps only the matching
+    # units and every chart and table shows capacity of the chosen array types
+    if (length(input$array)) d <- filter(d, coalesce(array_type, "Not reported") %in% input$array)
     q <- trimws(q_d())
     if (nzchar(q)) d <- filter(d, grepl(q, plant, ignore.case = TRUE) |
                                   grepl(q, owner, ignore.case = TRUE))
@@ -751,6 +770,9 @@ server <- function(input, output, session) {
         mwac_dc  = sum(mw[!is.na(mwdc)]),
         known_mw   = sum(mw[!is.na(array_type)]),
         tracker_mw = sum(mw[array_type %in% c("Single-axis tracker", "Dual-axis tracker")]),
+        fixed_mw   = sum(mw[array_type %in% c("Fixed tilt", "East-west fixed")]),
+        bif_mw     = sum(mw[bifacial %in% TRUE]),
+        bif_known_mw = sum(mw[!is.na(bifacial)]),
         mw = sum(mw), n_gen = n(),
         .groups = "drop") |>
       mutate(ilr = ifelse(!is.na(mwdc) & mwac_dc > 0, mwdc / mwac_dc, NA_real_)) |>
@@ -997,52 +1019,66 @@ server <- function(input, output, session) {
   })
 
   # ---- Capacity by owner ----
+  # Shares of operating capacity are over MWac that has array data, so a
+  # missing EIA-860 record doesn't read as "fixed" or "monofacial"
+  share <- function(num, den) ifelse(den > 0, num / den, NA_real_)
+
   owner_tbl <- reactive({
-    s <- sites_all()
+    s <- sites_all() |> mutate(op = stage == "Operating")
     s |>
       group_by(Owner = owner) |>
       summarise(
-        `Operating sites` = sum(stage == "Operating"),
-        `Operating MWac`  = sum(mw[stage == "Operating"]),
-        `Operating MWdc`  = {
-          o <- stage == "Operating" & !is.na(mwdc)
-          if (any(o)) sum(mwdc[o]) else NA_real_
-        },
-        # share of operating MWac with a known array type that is on trackers
-        `Tracker share`   = {
-          k <- sum(known_mw[stage == "Operating"])
-          if (k > 0) sum(tracker_mw[stage == "Operating"]) / k else NA_real_
-        },
+        `Operating sites` = sum(op),
+        `Operating MWac`  = sum(mw[op]),
+        `Operating MWdc`  = if (any(op & !is.na(mwdc))) sum(mwdc[op & !is.na(mwdc)]) else NA_real_,
+        ac_dc     = sum(mwac_dc[op]),
+        known     = sum(known_mw[op]),
+        tracker   = sum(tracker_mw[op]),
+        fixed     = sum(fixed_mw[op]),
+        bif       = sum(bif_mw[op]),
+        bif_known = sum(bif_known_mw[op]),
         `Under constr. MWac` = sum(mw[stage == "Under construction"]),
         `Permitted MWac`  = sum(mw[stage == "Permitted"]),
         `Earlier-stage MWac` = sum(mw[stage %in% c("Pending approval", "Early planning")]),
         States = n_distinct(state),
-        `Largest site` = {
-          o <- stage == "Operating"
-          if (any(o)) sprintf("%s (%s MW)", plant[o][which.max(mw[o])],
-                              formatC(max(mw[o]), format = "f", digits = 0))
-          else "-"
-        },
+        `Largest site` = if (any(op)) sprintf("%s (%s MW)", plant[op][which.max(mw[op])],
+                                              formatC(max(mw[op]), format = "f", digits = 0))
+                         else "-",
         .groups = "drop") |>
-      mutate(`Total incl. pipeline` = `Operating MWac` + `Under constr. MWac` +
-               `Permitted MWac` + `Earlier-stage MWac`,
-             `Share of operating` = `Operating MWac` / max(sum(`Operating MWac`), 1)) |>
-      relocate(`Share of operating`, .after = `Operating MWac`) |>
+      mutate(
+        `Share of operating` = `Operating MWac` / max(sum(`Operating MWac`), 1),
+        `Fleet ILR`          = ifelse(ac_dc > 0, `Operating MWdc` / ac_dc, NA_real_),
+        `Tracker share`      = share(tracker, known),
+        `Fixed-tilt share`   = share(fixed, known),
+        `Bifacial share`     = share(bif, bif_known),
+        `Array data coverage`= share(known, `Operating MWac`),
+        `Total incl. pipeline` = `Operating MWac` + `Under constr. MWac` +
+                                 `Permitted MWac` + `Earlier-stage MWac`) |>
+      select(Owner, `Operating sites`, `Operating MWac`, `Share of operating`,
+             `Operating MWdc`, `Fleet ILR`, `Tracker share`, `Fixed-tilt share`,
+             `Bifacial share`, `Array data coverage`, `Under constr. MWac`,
+             `Permitted MWac`, `Earlier-stage MWac`, `Total incl. pipeline`,
+             States, `Largest site`) |>
       arrange(desc(`Operating MWac`), desc(`Total incl. pipeline`))
   })
 
+  OWNER_PCT <- c("Share of operating", "Tracker share", "Fixed-tilt share",
+                 "Bifacial share", "Array data coverage")
+
   output$owners <- renderDT({
     d <- owner_tbl()
+    num_cols <- which(vapply(d, is.numeric, logical(1))) - 1
     datatable(
-      d, rownames = FALSE, selection = "none", extensions = "Buttons",
+      d, rownames = FALSE, selection = "none",
       style = "bootstrap5", class = "compact hover",
-      options = list(pageLength = 15, dom = "Bftip", buttons = list("csv", "excel"),
+      options = list(pageLength = 15, dom = "ftip", scrollX = TRUE,
                      order = list(list(2, "desc")),
-                     columnDefs = list(list(className = "dt-right", targets = c(1:9, 11))))
+                     columnDefs = list(list(className = "dt-right", targets = unname(num_cols))))
     ) |>
       formatRound(c("Operating MWac", "Operating MWdc", "Under constr. MWac", "Permitted MWac",
                     "Earlier-stage MWac", "Total incl. pipeline"), digits = 0) |>
-      formatPercentage(c("Share of operating", "Tracker share"), digits = 1) |>
+      formatRound("Fleet ILR", digits = 2) |>
+      formatPercentage(OWNER_PCT, digits = 1) |>
       formatStyle("Operating MWac",
                   background = styleColorBar(c(0, max(d$`Operating MWac`, 1)),
                                              "rgba(94,106,210,0.35)"),
@@ -1055,20 +1091,50 @@ server <- function(input, output, session) {
                   backgroundPosition = "center")
   })
 
+  output$dl_owners <- downloadHandler(
+    filename = function() sprintf("us_solar_pv_owners_%s.csv", Sys.Date()),
+    content  = function(file) {
+      d <- owner_tbl() |>
+        mutate(across(all_of(OWNER_PCT), ~ round(100 * .x, 1)),
+               across(c(`Operating MWac`, `Operating MWdc`, `Under constr. MWac`,
+                        `Permitted MWac`, `Earlier-stage MWac`, `Total incl. pipeline`),
+                      ~ round(.x, 1)),
+               `Fleet ILR` = round(`Fleet ILR`, 3)) |>
+        rename_with(~ paste(.x, "(%)"), all_of(OWNER_PCT))
+      write.csv(d, file, row.names = FALSE, na = "", fileEncoding = "UTF-8")
+    }
+  )
+
   # ---- Site table ----
+  # One frame feeds both the on-screen table and the CSV, in the same row order
+  # as sites() so a selected row maps back to the right bubble
+  sites_tbl_data <- reactive({
+    sites() |> transmute(
+      Site = plant, Stage = as.character(stage), Owner = owner, State = state,
+      County = county, MWac = round(mw, 1), MWdc = round(mwdc, 1),
+      ILR = round(ilr, 2), Array = array, Bifacial = bifacial, Module = module,
+      `Tilt °` = round(tilt), `Azimuth °` = round(azimuth),
+      Units = n_gen, Online = online, Status = status, Sector = sector, BA = ba,
+      Lat = round(lat, 4), Lon = round(lon, 4), `EIA ID` = plant_id)
+  })
+
+  output$dl_sites <- downloadHandler(
+    filename = function() sprintf("us_solar_pv_sites_%s.csv", Sys.Date()),
+    content  = function(file) {
+      d <- sites_tbl_data() |> rename(`Tilt (deg)` = `Tilt °`, `Azimuth (deg)` = `Azimuth °`)
+      write.csv(d, file, row.names = FALSE, na = "", fileEncoding = "UTF-8")
+    }
+  )
+
   output$sites_tbl <- renderDT({
+    d <- sites_tbl_data()
+    num_cols <- which(vapply(d, is.numeric, logical(1))) - 1
     datatable(
-      sites() |> transmute(Site = plant, Stage = stage, Owner = owner, State = state,
-                           County = county, MWac = round(mw, 1), MWdc = round(mwdc, 1),
-                           ILR = round(ilr, 2), Array = array,
-                           Bifacial = bifacial, Module = module,
-                           `Tilt °` = round(tilt), `Azimuth °` = round(azimuth),
-                           Units = n_gen, `Online` = online, Sector = sector, BA = ba,
-                           `EIA ID` = plant_id),
+      d,
       rownames = FALSE, selection = "single", style = "bootstrap5", class = "compact hover",
       options = list(pageLength = 12, dom = "ftip", order = list(list(5, "desc")),
                      scrollX = TRUE,
-                     columnDefs = list(list(className = "dt-right", targets = c(5:7, 11:13))))
+                     columnDefs = list(list(className = "dt-right", targets = unname(num_cols))))
     ) |>
       formatStyle("Stage", color = styleEqual(STAGES, unname(STAGE_COLS))) |>
       formatStyle("Array", color = styleEqual(names(ARRAY_COLS), unname(ARRAY_COLS)))

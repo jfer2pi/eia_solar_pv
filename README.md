@@ -8,8 +8,13 @@ monthly generator inventory ([Form EIA-860M](https://www.eia.gov/electricity/dat
   are dashed rings.
 - **Capacity trajectory**: annual additions by year online, with the cumulative fleet
   projected stage by stage (+ under construction, + permitted, + full pipeline).
-- **Capacity by owner** table with operating and pipeline MWac, exportable to CSV/Excel.
-- State and size breakdowns, KPI cards, and a searchable site table that flies the map to a site.
+- **Capacity by owner** table: operating MWac and MWdc, fleet ILR, tracker / fixed-tilt /
+  bifacial shares, array data coverage, and pipeline MWac by stage.
+- **Site table**: MWac, MWdc, ILR, array type, bifacial, module, tilt/azimuth, status,
+  coordinates and EIA ID; selecting a row flies the map to the site.
+- **CSV download** on each table (exports every row that matches the sidebar filters).
+- Filters by stage, state, sector, **array type**, site size, online year and name.
+- State and size breakdowns and KPI cards.
 - Linear-style dark UI (bslib).
 
 ## Data
