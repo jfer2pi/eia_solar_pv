@@ -474,6 +474,9 @@ theme <- bs_theme(
        border:1px solid %4$s; border-radius:6px; font-size:0.72rem; box-shadow:none; padding:8px 10px; }
   .size-legend .t { color:%2$s; margin-bottom:4px; }
   .leaflet-bar a, .leaflet-control-layers { background:#141516; color:%6$s; border-color:%4$s; }
+  .leaflet-bar button.easy-button-button { background:#141516; color:%6$s; border:0;
+       width:30px; height:30px; }
+  .leaflet-bar button.easy-button-button:hover { background:#1C1D1F; }
   .leaflet-control-layers-expanded { font-size:0.75rem; }
   .leaflet-control-attribution { background:rgba(8,9,10,0.75) !important; color:%3$s; }
   .leaflet-control-attribution a { color:%2$s; }
@@ -533,6 +536,9 @@ size_legend_html <- function() {
   sprintf("<div class='size-legend'><div class='t'>Bubble area = MWac</div>
           <svg width='%d' height='%d'>%s</svg></div>", ceiling(2 * max(r) + 30), ceiling(h + 12), circles)
 }
+
+# Initial map view, also used by the map's reset button
+MAP_HOME <- list(lng = -98.5, lat = 39.5, zoom = 4L)
 
 # Card header with a CSV download button on the right
 table_header <- function(title, sub, dl_id) {
@@ -829,7 +835,11 @@ server <- function(input, output, session) {
                options = tileOptions(maxZoom = 19)) |>
       addLayersControl(baseGroups = c("OSM dark", "OSM standard"),
                        options = layersControlOptions(collapsed = TRUE)) |>
-      setView(-98.5, 39.5, zoom = 4) |>
+      setView(MAP_HOME$lng, MAP_HOME$lat, zoom = MAP_HOME$zoom) |>
+      addEasyButton(easyButton(
+        icon = "fa-globe", title = "Reset view to the whole US",
+        onClick = htmlwidgets::JS(sprintf("function(btn, map) { map.flyTo([%f, %f], %d, {duration: 0.8}); }",
+                             MAP_HOME$lat, MAP_HOME$lng, MAP_HOME$zoom)))) |>
       addLegend("bottomright", colors = unname(STAGE_COLS), labels = STAGES,
                 title = "Stage", opacity = 1) |>
       addControl(html = HTML(size_legend_html()), position = "bottomleft",
