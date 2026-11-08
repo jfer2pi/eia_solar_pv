@@ -1,5 +1,7 @@
 # US Solar PV Fleet
 
+**[Open the live app](https://jfer2pi-pv-us.share.connect.posit.cloud/)** · Part of [Fernando Rodríguez Alvarado's portfolio](https://jfer2pi.github.io)
+
 Shiny dashboard of utility-scale solar PV in the United States, built on the U.S. EIA's
 monthly generator inventory ([Form EIA-860M](https://www.eia.gov/electricity/data/eia860m/)).
 
